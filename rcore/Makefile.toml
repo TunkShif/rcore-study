@@ -1,0 +1,63 @@
+[tasks.clean]
+command = "cargo"
+args = ["clean"]
+
+[tasks.build]
+command = "cargo"
+args = ["build"]
+dependencies = ["clean"]
+
+[tasks.release]
+command = "cargo"
+args = ["build", "--release"]
+dependencies = ["clean"]
+
+[tasks.strip]
+command = "rust-objcopy"
+args = [
+  "--strip-all",
+  "target/riscv64gc-unknown-none-elf/release/rcore",
+  "-O",
+  "binary",
+  "target/riscv64gc-unknown-none-elf/release/rcore.bin"
+]
+dependencies = ["release"]
+
+[tasks.debug]
+command = "qemu-system-riscv64"
+args = [
+  "-machine",
+  "virt",
+  "-nographic",
+  "-bios",
+  "../bootloader/rustsbi-qemu.bin",
+  "-device",
+  "loader,file=target/riscv64gc-unknown-none-elf/release/rcore.bin,addr=0x80200000",
+  "-s",
+  "-S"
+]
+dependencies = ["strip"]
+
+[tasks.run]
+command = "qemu-system-riscv64"
+args = [
+  "-machine",
+  "virt",
+  "-nographic",
+  "-bios",
+  "../bootloader/rustsbi-qemu.bin",
+  "-device",
+  "loader,file=target/riscv64gc-unknown-none-elf/release/rcore.bin,addr=0x80200000"
+]
+dependencies = ["strip"]
+
+[tasks.gdb]
+command = "riscv64-elf-gdb"
+args = [
+  "-ex", 
+  "file target/riscv64gc-unknown-none-elf/release/rcore",
+  "-ex", 
+  "set arch riscv:rv64",
+  "-ex", 
+  "target remote localhost:1234"
+]
