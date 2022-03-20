@@ -359,4 +359,273 @@ args = [
 
 之后需要直接运行 Qemu 的时候只需要在 `rcore` 目录下执行 `cargo make run`，需要调试运行 Qemu 的话只需要执行 `cargo make debug`，然后再使用 `cargo make gdb` 来启动 gdb。
 
-### TO BE CONTINUED
+### 函数调用与调用栈
+
+汇编指令在被 CPU 执行时是按照物理地址顺序依次连续向下逐条执行的，缺少在编程语言当中的结构化的控制流（例如 `if else` `while` 等分支结构），只能进行基于指令地址的跳转。
+
+另一种更加复杂的控制流程结构是**函数调用**，同一个函数可能在多个地方被调用，并且在被调用完毕后还需要能够返回到被调用处。要实现函数调用不能只进行简单的跳转，RISC-V 指令集中提供了以下关于函数调用跳转的指令：
+
+| 指令                      | 功能                                             |
+| :------------------------ | :----------------------------------------------- |
+| $jal\ rd, imm[20:1]$      | $rd \leftarrow pc + 4 \\ pc \leftarrow pc + imm$ |
+| $jalr\ rd, (imm[10:0])rs$ | $rd \leftarrow pc + 4 \\ pc \leftarrow rs + imm$ |
+
+其中 `rs` 表示源寄存器，`imm` 表示立即数，`rd` 代表目标寄存器。这两条指令在 `pc` 寄存器中写入将要跳转的指令地址之前，还将当前指令的下一条指令地址保存在了 `rd` 寄存器中（这里假定所有指令长度均为 4 字节）。
+
+在 RISC-V 架构中通常使用 `ra` 寄存器作为目标寄存器，即在函数执行完毕返回的时候，只需要跳转回 `ra` 所保存的地址。
+
+由于我们将返回的地址保存在了 `ra` 寄存器当中，所以在函数执行的过程中该寄存器的值始终不能发生变化，否则就不能跳转返回到函数执行之前的位置。但整个 CPU 仅有一套寄存器，如果按照上面的描述实现函数调用，则不能实现多层函数嵌套调用，因为每产生一次函数调用，`ra` 寄存器中存储的之前的地址就会被覆盖。
+
+像这样的由于函数调用，在控制流转移前后需要保持不变的寄存器的合集称为**函数调用上下文**。我们需要将这些函数调用上下文保存在物理内存上，在当函数调用完毕后从内存当中读取恢复函数调用上下文中的寄存器内容。
+
+这块特定的内存区域则被称作**栈**，用 `sp` 寄存器来保存栈顶指针，在 RISC-V 架构中栈由高地址向低地址增长。在函数被调用的时候，栈中会被分配一块新的内存区域，用来进行函数调用上下文的保存与恢复，这块内存叫做**栈帧**。
+
+#### 分配启动栈
+
+在 `entry.asm` 这一小段入口的汇编内分配启动栈空间，并将栈指针寄存器 `sp` 设置为栈顶的位置，然后将控制权转交给 Rust 的主函数入口。
+
+```shell
+    .section .text.entry
+    .global _start
+_start:
+    la sp, boot_stack_top
+    call rust_main
+
+    .section .bss.stack
+    .global boot_stack
+boot_stack:
+    .space 4096 * 16
+    .global boot_stack_top
+boot_stack_top:
+```
+
+`.bss` 段包含了静态分配的已声明但没有赋值的变量，我们分配了一块大小为 $4096 * 16$ 字节即 $64 KiB$ 的内存空间用作栈空间，并分配为 `.bss.stack` 段，用**高地址**符号 `boot_stack_top` 来标识栈顶，用**低地址**符号 `boot_stack` 标识栈底。最终 `.bss.stack` 段在链接的过程中会被汇合到 `.bss` 段的最高处。
+
+接下来在 `rcore/src/main.rs` 当中编写新的执行入口，注意需要使用 `#[no_mangle]` 标注，防止编译器对该函数的名字进行混淆，否则在链接的时候就无法找到 `rust_main` 这个符号。
+
+```rust
+#[no_mangle]
+pub fn rust_main() -> ! {
+  loop {}
+}
+```
+
+我们前面提到 `.bss` 段一般用于放置已声明但未赋值的变量，我们需要给该段的数据初始化为零。
+
+```rust
+#[no_mangle]
+pub fn rust_main() -> ! {
+    clear_bss();
+    loop {}
+}
+
+fn clear_bss() {
+    extern "C" {
+        fn sbss();
+        fn ebss();
+    }
+    ((sbss as usize)..(ebss as usize)).for_each(|b| unsafe { (b as *mut u8).write_volatile(0) });
+}
+```
+
+在 `clear_bss()` 函数当中的 `extern "C" {}` 中可以引用一个外部的 C 函数接口，这里引用了两个在链接脚本里定义的符号，`sbss` 和 `ebss`，分别表示 `bss` 段的起始地址和结束地址。之后将该区间内的每个地址转为指针 `*mut u8`，写入零值，从而实现了遍历该地址区间并逐字节清零。
+
+### 使用 SBI 服务
+
+RISC-V SBI 全称为 *Supervisor Binary Interface*，提供了访问仅限于机器模式的寄存器的接口，介于底层硬件与内核之间。它除了在计算机启动时负责对环境进行初始化工作之后将计算机控制权移交给内核，实际上还作为内核的执行环境，在内核运行时响应内核的请求为内核提供服务。SBI 有多种实现，OpenSBI 是 RISC-V 官方提供的 C 语言实现参考，我们用到的 RustSBI 是其对应的 Rust 语言实现。
+
+> 关于 SBI 于 BIOS 之间有什么关系，参考这条[评论](https://github.com/rcore-os/rCore-Tutorial-Book-v3/issues/71#issuecomment-869029635)。
+
+新建一个 `sbi` 模块，用以提供 SBI 服务。
+
+```rust
+// rcore/src/sbi.rs
+#![allow(unused)]
+
+use core::arch::asm;
+
+const SBI_SET_TIMER: usize = 0;
+const SBI_CONSOLE_PUTCHAR: usize = 1;
+const SBI_CONSOLE_GETCHAR: usize = 2;
+const SBI_CLEAR_IPI: usize = 3;
+const SBI_SEND_IPI: usize = 4;
+const SBI_REMOTE_FENCE_I: usize = 5;
+const SBI_REMOTE_SFENCE_VMA: usize = 6;
+const SBI_REMOTE_SFENCE_VMA_ASID: usize = 7;
+const SBI_SHUTDOWN: usize = 8;
+
+#[inline(always)]
+fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
+    let mut ret;
+    unsafe {
+        asm!(
+        "ecall",
+        inlateout("x10") arg0 => ret,
+        in("x11") arg1,
+        in("x12") arg2,
+        in("x17") which
+        )
+    }
+    ret
+}
+```
+
+在 `sbi_call()` 函数实现中，我们内嵌了一段汇编来实现 SBI 服务的调用，同时将调用结果返回。在最上面定义了部分 RustSBI 支持的服务类型的对应的编号，因为目前我们并未用到所有的定义的常量，Rust 在编译时会针对未使用的变量给出警告，暂时使用 `#[allow(unused)]` 标注来取消警告。
+
+之后我们便可以将 SBI 服务封装成函数，例如打印输出字符，关机服务。
+
+```rust
+// rcore/src/sbi.rs
+pub fn console_putchar(ch: usize) {
+    sbi_call(SBI_CONSOLE_PUTCHAR, ch, 0, 0);
+}
+
+pub fn shutdown() -> ! {
+    sbi_call(SBI_SHUTDOWN, 0, 0, 0);
+    panic!("Shutdown failed!");
+}
+```
+
+### 实现格式化输出宏
+
+现在来实现标准库中的 `print!()` 和 `println!()` 宏，新建一个 `console` 模块。
+
+```rust
+// rcore/src/console.rs
+use crate::sbi::console_putchar;
+use core::fmt::{self, Write};
+
+struct StdOut;
+
+impl Write for StdOut {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        s.chars().for_each(|ch| console_putchar(ch as usize));
+        Ok(())
+    }
+}
+
+pub fn print(args: fmt::Arguments) {
+    StdOut.write_fmt(args).unwrap()
+}
+
+#[macro_export]
+macro_rules! print {
+    ($fmt: literal $(, $(arg: tt)+)?) => {
+        $crate::console::print(format_args!($fmt $(, $($arg)+)?));
+    }
+}
+
+#[macro_export]
+macro_rules! println {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::console::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?));
+    }
+}
+```
+
+`fmt::Write` 这个 trait 中包含一个 `write_fmt()` 方法，我们借助它来实现 `println!()`。要实现 `fmt::Write` trait 只需要实现 `write_str` 方法即可，这个方法是用于输出一个字符串，我们只需要逐个遍历输出字符即可。
+
+### 完善 panic
+
+现在我们实现了输出功能了，可以完善之前的 `panic()` 实现，使得在产生致命错误的时候能够打印出相关错误信息。
+
+```rust
+// rcore/src/lang_items.rs
+use crate::sbi::shutdown;
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        println!(
+            "Panicked at {}:{} {}",
+            location.file(),
+            location.line(),
+            info.message().unwrap()
+        );
+    } else {
+        println!("Pacnicked: {}", info.message().unwrap());
+    }
+    shutdown()
+}
+```
+
+之后可以在我们的函数入口 `rust_main()` 里面调用测试一下。
+
+### 练习：实现彩色日志输出
+
+实现彩色输出其实很简单，只需要在对应字符串前加上特定颜色代码的转义字符就行。
+
+```shell
+echo -e "\x1b[31mHello, world!\x1b[0m"
+```
+
+为了便于实现分级别输出日志，可以使用 `log` 这个 crate，并且这个 `crate` 可以在没有标准库的情况下使用。
+
+要实现一个自己的 Logger 只需要实现 `log::Log` 这个 trait 即可，然后我们就能够使用 `log` 模块内提供的 `info!()` `debug!()` 等宏来进行日志输出。
+
+更加详细的文档可以参考 [log - docs.rs](https://docs.rs/log/0.4.14/log/)，下面放出具体实现：
+
+```rust
+// rcore/src/logging.rs
+use log::{Level, LevelFilter, Log};
+
+struct Logger;
+
+static LOGGER: Logger = Logger;
+
+pub fn init() {
+    log::set_logger(&LOGGER)
+        .map(|()| log::set_max_level(LevelFilter::Trace))
+        .unwrap()
+}
+
+impl Log for Logger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let color = log_level_to_color(record.metadata().level());
+            println!(
+                "\x1b[{}m[{}] - {}\x1b[0m",
+                color,
+                record.metadata().level().as_str(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn log_level_to_color(level: log::Level) -> usize {
+    match level {
+        Level::Error => 31,
+        Level::Debug => 32,
+        Level::Info => 34,
+        Level::Warn => 93,
+        Level::Trace => 90,
+    }
+}
+```
+
+之后我们便可以在入口函数当中使用 logger。
+
+```rust
+// rcore/src/main.rs
+#[no_mangle]
+pub fn rust_main() -> ! {
+    clear_bss();
+    logging::init();
+    println!("Hello World!");
+    log::info!("test");
+    log::error!("error!");
+    sbi::shutdown();
+}
+```
+
+运行效果如下图
+
+![image](https://user-images.githubusercontent.com/10807119/159147490-05613fc0-6d46-4726-a3e4-bbb94d8ec20c.png)
